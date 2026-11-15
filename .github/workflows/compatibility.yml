@@ -1,0 +1,164 @@
+name: Windows compatibility checks
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/compatibility.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    if: github.repository == 'seon0030-bot/stay-review-assistant-updates'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Verify public downloads, execution, UI and updates
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $work = Join-Path (Get-Location) 'compatibility-work'
+          $report = Join-Path (Get-Location) 'compatibility-results'
+          if (Test-Path -LiteralPath $work) { throw 'Use a fresh workspace for each run.' }
+          New-Item -ItemType Directory -Path $work,$report | Out-Null
+          $unicodeDir = 'PC ' + [char]0xac80 + [char]0xc0ac + ' files'
+          $app = Join-Path $work $unicodeDir
+          $old = Join-Path $work 'previous'
+          $base = 'https://github.com/seon0030-bot/stay-review-assistant-updates/releases/download/updates/'
+          $checks = [Collections.Generic.List[object]]::new()
+          function Run-App([string]$Exe, [string[]]$Arguments) {
+              $quoted = ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
+              $proc = Start-Process -FilePath $Exe -ArgumentList $quoted -PassThru -WindowStyle Hidden
+              if (!$proc.WaitForExit(120000)) { $proc.Kill(); throw 'Application test timed out.' }
+              if ($proc.ExitCode -ne 0) { throw ('Application exited with code ' + $proc.ExitCode) }
+          }
+          function Check([string]$Name, [scriptblock]$Body) {
+              try { & $Body; $checks.Add(@{name=$Name;passed=$true}); Write-Host "PASS $Name" }
+              catch { $checks.Add(@{name=$Name;passed=$false;error=$_.Exception.Message}); Write-Host "FAIL ${Name}: $_" }
+          }
+          try {
+              $os = Get-CimInstance Win32_OperatingSystem
+              $runtime = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full'
+              @{atUtc=[DateTime]::UtcNow.ToString('o');os=$os.Caption;build=$os.BuildNumber;architecture=$os.OSArchitecture;runner=$env:RUNNER_ARCH;image=$env:ImageVersion;frameworkRelease=$runtime.Release;processBits=([IntPtr]::Size*8);powershell=$PSVersionTable.PSVersion.ToString()} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $report 'environment.json') -Encoding UTF8
+              if ($runtime.Release -lt 461808) { throw '.NET Framework 4.7.2 or later is required.' }
+              $packages = @(
+                @{version='0.6.2';sha='28ece4362668a944680f1c877c391a3523f60ae180b8f4482d830adb6060171a';destination=$app},
+                @{version='0.6.1';sha='920ef406daaabae7dfd5393668d60172ea8334d16f73752e16529080e4b4a8d3';destination=$old}
+              )
+              foreach ($p in $packages) {
+                  $file = 'StayReviewAssistant-Windows-v' + $p.version + '.zip'
+                  $zip = Join-Path $work $file
+                  Invoke-WebRequest -UseBasicParsing -Uri ($base+$file) -OutFile $zip
+                  if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $p.sha) { throw "Public download hash mismatch: $file" }
+                  Expand-Archive -LiteralPath $zip -DestinationPath $p.destination
+              }
+              $exe = Join-Path $app 'StayReviewAssistant.exe'
+              $baseline = Join-Path $old 'StayReviewAssistant.exe'
+              $sig = Get-AuthenticodeSignature -LiteralPath $exe
+              @{status=$sig.Status.ToString();statusMessage=$sig.StatusMessage;sha256=(Get-FileHash -LiteralPath $exe).Hash;version=[Diagnostics.FileVersionInfo]::GetVersionInfo($exe).FileVersion} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $report 'publisher-signature.json') -Encoding UTF8
+              Check 'Public executable and framework start; 75 built-in behavior checks' {
+                  $data = Join-Path $work 'behavior'
+                  Run-App $exe @('--selftest',$data)
+                  $text = Get-Content -LiteralPath (Join-Path $data 'selftest-results.txt') -Raw
+                  $text | Set-Content -LiteralPath (Join-Path $report 'selftest-results.txt') -Encoding UTF8
+                  if ($text -notmatch 'TOTAL 75 passed / 0 failed') { throw 'Unexpected behavior test totals.' }
+              }
+              Check '26 update integrity, mandatory lock, install and rollback checks' {
+                  $data = Join-Path $work 'updates'
+                  Run-App $exe @('--update-selftest',$data,$baseline)
+                  Copy-Item -LiteralPath (Join-Path $data 'update-tests.txt'),(Join-Path $data 'update-summary.json') -Destination $report
+                  $summary = Get-Content -LiteralPath (Join-Path $data 'update-summary.json') -Raw | ConvertFrom-Json
+                  if ($summary.failed -ne 0 -or $summary.passed -ne 26) { throw 'Unexpected update test totals.' }
+              }
+              foreach ($mode in @('reply','settings','small','update')) {
+                  Check ("WinForms display: $mode") {
+                      $png = Join-Path $report ($mode+'.png')
+                      Run-App $exe @(('--render-'+$mode),$png,(Join-Path $work ('render-'+$mode)))
+                      if (!(Test-Path -LiteralPath $png) -or (Get-Item -LiteralPath $png).Length -lt 1000) { throw 'No rendered window.' }
+                  }
+              }
+              $liveScript = Join-Path $work 'live-probe.ps1'
+              @'
+          param([string]$Exe,[string]$Data,[string]$Report,[bool]$Upgrade)
+          $ErrorActionPreference='Stop'
+          Add-Type -AssemblyName System.Net.Http
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [Reflection.Assembly]::LoadFrom($Exe) | Out-Null
+          New-Item -ItemType Directory -Path $Data | Out-Null
+          $keep=Join-Path $Data 'preserve.txt'
+          [IO.File]::WriteAllText($keep,'synthetic-preservation-marker')
+          $channel=[StayReview.UpdateChannel]::Load()
+          if (!$channel.Configured) { throw 'Production channel missing.' }
+          $service=New-Object StayReview.UpdateService($Data,$channel,$null)
+          try {
+            if ($service.CanOperate) { throw 'Startup verification gate bypassed.' }
+            $service.Check([Threading.CancellationToken]::None).GetAwaiter().GetResult()
+            if (!$service.Available) { throw $service.Message }
+            $result=@{current=[StayReview.UpdateSecurity]::Current.ToString();server=$service.Available.version;sequence=$service.Available.sequence;required=$service.Required;canOperate=$service.CanOperate;processBits=([IntPtr]::Size*8)}
+            if ($Upgrade) {
+              if (!$service.Required -or $service.CanOperate) { throw 'Old version was allowed to operate.' }
+              $again=New-Object StayReview.UpdateService($Data,$channel,$null)
+              try { if (!$again.Required -or $again.CanOperate) { throw 'Mandatory gate lost on restart.' } } finally { $again.Dispose() }
+              $folder=$service.Download($null,[Threading.CancellationToken]::None).GetAwaiter().GetResult()
+              $install=Join-Path $Data 'isolated-install'
+              New-Item -ItemType Directory -Path $install | Out-Null
+              Copy-Item -LiteralPath $Exe,($Exe+'.config') -Destination $install
+              $plan=New-Object StayReview.InstallPlan
+              $plan.installDir=$install;$plan.dataRoot=$Data;$plan.envelope=$service.Envelope
+              [StayReview.UpdateInstaller]::Apply($folder,$plan,$channel,$null)
+              $result.installed=[Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $install 'StayReviewAssistant.exe')).FileVersion
+              if ([version]$result.installed -ne [version]$result.server) { throw 'Wrong installed version.' }
+              if ([IO.File]::ReadAllText($keep) -ne 'synthetic-preservation-marker') { throw 'Data lost.' }
+              $result.preserved=$true
+            } elseif ($service.Required -or !$service.CanOperate) { throw $service.Message }
+            $result | ConvertTo-Json | Set-Content -LiteralPath $Report -Encoding UTF8
+          } finally { $service.Dispose() }
+          '@ | Set-Content -LiteralPath $liveScript -Encoding UTF8
+              $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+              Check 'Live signed channel on current version' {
+                  & $ps -NoProfile -File $liveScript -Exe $exe -Data (Join-Path $work 'live-current') -Report (Join-Path $report 'live-current.json')
+                  if ($LASTEXITCODE -ne 0) { throw 'Current release online check failed.' }
+              }
+              Check 'Live upgrade from public previous version with data preservation' {
+                  # A wrapper supplies a real Boolean to Windows PowerShell 5.1.
+                  $wrapper = Join-Path $work 'upgrade-probe.ps1'
+                  '& $PSScriptRoot\live-probe.ps1 -Exe $args[0] -Data $args[1] -Report $args[2] -Upgrade $true' | Set-Content -LiteralPath $wrapper -Encoding UTF8
+                  & $ps -NoProfile -File $wrapper $baseline (Join-Path $work 'live-upgrade') (Join-Path $report 'live-upgrade.json')
+                  if ($LASTEXITCODE -ne 0) { throw 'Live upgrade check failed.' }
+              }
+              $x86 = Join-Path $env:SystemRoot 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
+              Check '32-bit framework loading and live signed channel' {
+                  if (!(Test-Path -LiteralPath $x86)) { throw '32-bit Windows PowerShell unavailable.' }
+                  & $x86 -NoProfile -File $liveScript -Exe $exe -Data (Join-Path $work 'live-x86') -Report (Join-Path $report 'live-x86.json')
+                  if ($LASTEXITCODE -ne 0) { throw '32-bit runtime check failed.' }
+                  $probe = Get-Content -LiteralPath (Join-Path $report 'live-x86.json') -Raw | ConvertFrom-Json
+                  if ($probe.processBits -ne 32) { throw 'Expected a 32-bit process.' }
+              }
+          } catch {
+              $checks.Add(@{name='Test setup';passed=$false;error=$_.Exception.Message})
+              Write-Host "FAIL setup: $_"
+          } finally {
+              foreach ($dir in @($app,$old)) {
+                  $diagnostic = Join-Path $dir 'diagnostic-error.txt'
+                  if (Test-Path -LiteralPath $diagnostic) { Copy-Item -LiteralPath $diagnostic -Destination (Join-Path $report ((Split-Path -Leaf $dir)+'-diagnostic.txt')) }
+              }
+              $checks | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $report 'checks.json') -Encoding UTF8
+              if ($env:GITHUB_STEP_SUMMARY) {
+                  @('Public v0.6.2 compatibility checks','','| Check | Result |','| --- | --- |') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+                  $checks | ForEach-Object { '| '+$_.name+' | '+$(if($_.passed){'PASS'}else{'FAIL'})+' |' } | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+                  'These tests do not prove SmartScreen acceptance, standard-user permissions, Windows 10 client compatibility or live Airbnb posting. Authenticode status is recorded separately.' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+              }
+          }
+          if ($checks.Where({!$_.passed}).Count -gt 0) { exit 1 }
+      - name: Preserve isolated test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compatibility-${{ matrix.os }}
+          path: compatibility-results/
+          if-no-files-found: error
+          retention-days: 14
