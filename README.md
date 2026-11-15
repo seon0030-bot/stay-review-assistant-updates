@@ -1,6 +1,6 @@
 # 숙소 후기 도우미
 
-[Windows 최신 설치 파일 다운로드](https://github.com/seon0030-bot/stay-review-assistant-updates/releases/download/updates/StayReviewAssistant-Windows-v0.6.1.zip)
+[Windows 최신 설치 파일 다운로드](https://github.com/seon0030-bot/stay-review-assistant-updates/releases/download/updates/StayReviewAssistant-Windows-v0.6.2.zip)
 
 ZIP 압축을 모두 풀고 `StayReviewAssistant.exe`를 실행하세요. 프로그램에서 에어비앤비에 연결한 후 대상과 문구를 확인해 사용합니다.
 
