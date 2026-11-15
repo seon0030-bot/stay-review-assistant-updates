@@ -1,0 +1,33 @@
+name: Renew signed update channel
+on:
+  schedule:
+    - cron: '23 18 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['channel/latest.json', 'renew-channel.mjs', '.github/workflows/renew.yml']
+permissions:
+  contents: write
+concurrency:
+  group: stable-update-channel
+  cancel-in-progress: false
+jobs:
+  renew:
+    if: github.repository == 'seon0030-bot/stay-review-assistant-updates' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - name: Verify package and renew signature
+        env:
+          RELEASE_SIGNING_JWK: ${{ secrets.RELEASE_SIGNING_JWK }}
+        run: node renew-channel.mjs
+      - name: Publish renewed channel
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add channel/latest.json
+          git commit -m 'Renew signed update channel'
+          git push origin HEAD:main
