@@ -130,11 +130,38 @@ jobs:
                   & $ps -NoProfile -File $wrapper $baseline (Join-Path $work 'live-upgrade') (Join-Path $report 'live-upgrade.json')
                   if ($LASTEXITCODE -ne 0) { throw 'Live upgrade check failed.' }
               }
-              $x86 = Join-Path $env:SystemRoot 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
+              $probeSource = Join-Path $work 'X86Probe.cs'
+              @'
+          using System;
+          using System.IO;
+          using System.Threading;
+          using System.Web.Script.Serialization;
+          using StayReview;
+          class X86Probe {
+            static int Main(string[] args) {
+              try {
+                if (IntPtr.Size != 4) throw new Exception("Expected 32-bit process.");
+                Directory.CreateDirectory(args[0]);
+                var channel=UpdateChannel.Load();
+                if (!channel.Configured) throw new Exception("Production channel missing.");
+                using(var service=new UpdateService(args[0],channel,null)) {
+                  if(service.CanOperate) throw new Exception("Startup gate bypassed.");
+                  service.Check(CancellationToken.None).GetAwaiter().GetResult();
+                  if(service.Available==null || service.Required || !service.CanOperate) throw new Exception(service.Message);
+                  File.WriteAllText(args[1],new JavaScriptSerializer().Serialize(new { processBits=32, current=UpdateSecurity.Current.ToString(), server=service.Available.version, canOperate=service.CanOperate }));
+                }
+                return 0;
+              } catch(Exception error) { File.WriteAllText(args[1],error.ToString()); return 1; }
+            }
+          }
+          '@ | Set-Content -LiteralPath $probeSource -Encoding UTF8
               Check '32-bit framework loading and live signed channel' {
-                  if (!(Test-Path -LiteralPath $x86)) { throw '32-bit Windows PowerShell unavailable.' }
-                  & $x86 -NoProfile -File $liveScript -Exe $exe -Data (Join-Path $work 'live-x86') -Report (Join-Path $report 'live-x86.json')
-                  if ($LASTEXITCODE -ne 0) { throw '32-bit runtime check failed.' }
+                  $compiler=Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+                  $x86=Join-Path $app 'X86Probe.exe'
+                  & $compiler /nologo /platform:x86 /target:exe ("/out:$x86") ("/reference:$exe") /reference:System.Net.Http.dll /reference:System.Web.Extensions.dll $probeSource
+                  if ($LASTEXITCODE -ne 0) { throw '32-bit test probe compilation failed.' }
+                  Copy-Item -LiteralPath ($exe+'.config') -Destination ($x86+'.config')
+                  Run-App $x86 @((Join-Path $work 'live-x86'),(Join-Path $report 'live-x86.json'))
                   $probe = Get-Content -LiteralPath (Join-Path $report 'live-x86.json') -Raw | ConvertFrom-Json
                   if ($probe.processBits -ne 32) { throw 'Expected a 32-bit process.' }
               }
